@@ -12,7 +12,7 @@ except ImportError:
     wandb = None
 
 from dataset import MITBIH_Dataset
-from model import UNet1D
+from dit_model import ECG_DiT_1D
 
 
 def save_checkpoint(state, path):
@@ -23,7 +23,8 @@ def save_checkpoint(state, path):
 
 def load_checkpoint(path, model, optimizer, device):
     checkpoint = torch.load(path, map_location=device)
-    model.load_state_dict(checkpoint)
+    model.load_state_dict(checkpoint["model"])
+    model = torch.compile(model)
     #optimizer.load_state_dict(checkpoint["optimizer"])
     if "epoch" in checkpoint:
         start_epoch = checkpoint["epoch"] + 1
@@ -40,13 +41,22 @@ def load_checkpoint(path, model, optimizer, device):
     #global_step = checkpoint.get("global_step", 0)
     #wandb_id = checkpoint.get("wandb_run_id")
     print(f"Resumed from checkpoint {path} at epoch {start_epoch}")
-    return start_epoch, global_step, wandb_id
+    return model, start_epoch, global_step, wandb_id
 
 
-def train(resume_path=None, cache_path=None, wandb_project="flow-arythmia", wandb_run_id=None, disable_wandb=False):
+def train(
+    resume_path=None,
+    cache_path=None,
+    wandb_project="flow-arythmia",
+    wandb_run_id=None,
+    disable_wandb=False,
+    dit_hidden=256,
+    dit_depth=6,
+    dit_heads=8,
+):
     # --- Configuration ---
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    BATCH_SIZE = 64
+    BATCH_SIZE = 1024
     LR = 1e-4
     EPOCHS = 100000 # Increase for better fidelity
     WINDOW_SIZE = 256
@@ -65,7 +75,15 @@ def train(resume_path=None, cache_path=None, wandb_project="flow-arythmia", wand
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 
     # --- Model ---
-    model = UNet1D(in_channels=1, dim=64).to(DEVICE)
+    model = ECG_DiT_1D(
+        input_size=WINDOW_SIZE,
+        patch_size=16,
+        hidden_size=dit_hidden,
+        depth=dit_depth,
+        num_heads=dit_heads,
+        num_classes=1,
+    ).to(DEVICE)
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
     # --- Flow Matching Wrapper ---
@@ -82,9 +100,9 @@ def train(resume_path=None, cache_path=None, wandb_project="flow-arythmia", wand
     start_epoch = 0
     global_step = 0
 
-    resume_target = resume_path or (checkpoint_path if os.path.exists(checkpoint_path) else None)
+    resume_target = resume_path
     if resume_target:
-        start_epoch, global_step, saved_wandb_id = load_checkpoint(resume_target, model, optimizer, DEVICE)
+        model, start_epoch, global_step, saved_wandb_id = load_checkpoint(resume_target, model, optimizer, DEVICE)
         if wandb_run_id is None and saved_wandb_id:
             wandb_run_id = saved_wandb_id
 
@@ -98,6 +116,10 @@ def train(resume_path=None, cache_path=None, wandb_project="flow-arythmia", wand
             "epochs": EPOCHS,
             "window_size": WINDOW_SIZE,
             "samples_per_record": dataset.__dict__.get("samples_per_record", 200),
+            "model": "ECG_DiT_1D",
+            "dit_hidden": dit_hidden,
+            "dit_depth": dit_depth,
+            "dit_heads": dit_heads,
         }
         wandb_run = wandb.init(
             project=wandb_project,
@@ -125,7 +147,8 @@ def train(resume_path=None, cache_path=None, wandb_project="flow-arythmia", wand
             t, xt, ut = cfm.sample_location_and_conditional_flow(x0, x1)
             
             # Predict vector field with model
-            vt = model(xt, t)
+            y = torch.zeros(x1.shape[0], dtype=torch.long, device=DEVICE)
+            vt = model(xt, t, y)
             
             # Loss is simply MSE between predicted direction and target direction
             loss = torch.mean((vt - ut) ** 2)
@@ -189,6 +212,9 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-project", type=str, default="flow-arythmia", help="Weights & Biases project name")
     parser.add_argument("--wandb-run-id", type=str, default=None, help="Existing Weights & Biases run ID to resume")
     parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
+    parser.add_argument("--dit-hidden", type=int, default=256, help="Hidden size for DiT model")
+    parser.add_argument("--dit-depth", type=int, default=6, help="Number of transformer blocks in DiT")
+    parser.add_argument("--dit-heads", type=int, default=8, help="Number of attention heads in DiT")
     args = parser.parse_args()
 
     train(
@@ -197,4 +223,7 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         wandb_run_id=args.wandb_run_id,
         disable_wandb=args.no_wandb,
+        dit_hidden=args.dit_hidden,
+        dit_depth=args.dit_depth,
+        dit_heads=args.dit_heads,
     )

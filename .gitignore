@@ -3,3 +3,6 @@
 /cache/
 /wandb/
 /__pycache__/
+/ptb/
+hungarian_matched_data.pt
+hungarian_matched_noise.pt

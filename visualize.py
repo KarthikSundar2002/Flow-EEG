@@ -1,7 +1,7 @@
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
-from model import UNet1D
+from dit_model import ECG_DiT_1D
 from dataset import MITBIH_Dataset
 
 def generate_ecg(model, num_samples=5, device="cuda"):
@@ -11,7 +11,10 @@ def generate_ecg(model, num_samples=5, device="cuda"):
     # 1. Start with Gaussian Noise (t=0)
     x = torch.randn(num_samples, 1, window_size).to(device)
     
-    # 2. Solve ODE from t=0 to t=1 (Euler Method)
+    # 2. Class labels (dummy, since num_classes=1 in training)
+    y = torch.zeros(num_samples, dtype=torch.long).to(device)
+    
+    # 3. Solve ODE from t=0 to t=1 (Euler Method)
     # 100 steps is usually enough for high quality
     steps = 100
     dt = 1.0 / steps
@@ -21,12 +24,12 @@ def generate_ecg(model, num_samples=5, device="cuda"):
         for i in range(steps):
             t = torch.ones(num_samples).to(device) * (i / steps)
             
-            # Predict velocity
-            v = model(x, t)
+            # Predict velocity (DiT requires class label y)
+            v = model(x, t, y)
             
             # Update state
             x = x + v * dt
-            
+    
     return x.cpu().numpy()
 
 def plot_comparison(real_data, fake_data):
@@ -53,10 +56,18 @@ def plot_comparison(real_data, fake_data):
 if __name__ == "__main__":
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load Model
-    model = UNet1D(in_channels=1, dim=64).to(DEVICE)
+    # Load Model (DiT with same parameters as training)
+    model = ECG_DiT_1D(
+        input_size=256,
+        patch_size=16,
+        hidden_size=256,
+        depth=6,
+        num_heads=8,
+        num_classes=1,
+    ).to(DEVICE)
+    
     try:
-        model.load_state_dict(torch.load("ecg_flow_model_ep4000.pth", map_location=DEVICE))
+        model.load_state_dict(torch.load("checkpoints/latest.pt", map_location=DEVICE)["model"])
         print("Model loaded successfully.")
     except FileNotFoundError:
         print("Model file not found! Please run train.py first.")
