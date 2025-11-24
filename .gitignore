@@ -1,0 +1,5 @@
+/.venv/
+/checkpoints/
+/cache/
+/wandb/
+/__pycache__/
