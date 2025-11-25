@@ -1,3 +1,4 @@
+import ast
 import os
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -6,6 +7,15 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 import wfdb
+from tqdm import tqdm
+
+
+def _mean_center_signal(signal: torch.Tensor) -> torch.Tensor:
+    """
+    Subtracts the per-channel mean so each window is zero centered.
+    """
+    mean = signal.mean(dim=1, keepdim=True)
+    return signal - mean
 
 
 def _normalize_signal(signal: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -16,9 +26,9 @@ def _normalize_signal(signal: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         signal: Tensor of shape (C, T).
         eps: Numerical stability constant.
     """
-    mean = signal.mean(dim=1, keepdim=True)
-    std = signal.std(dim=1, keepdim=True)
-    return (signal - mean) / (std + eps)
+    centered = _mean_center_signal(signal)
+    std = centered.std(dim=1, keepdim=True)
+    return centered / (std + eps)
 
 
 class PTBXLWaveformDataset(Dataset):
@@ -83,13 +93,35 @@ class PTBXLWaveformDataset(Dataset):
                 "Download PTB-XL from PhysioNet first: https://physionet.org/content/ptb-xl/1.0.3/"
             )
 
+        # Load diagnostic class mappings
+        scp_path = os.path.join(self.data_dir, "scp_statements.csv")
+        self.class_to_idx = None
+        self.idx_to_class = None
+        if os.path.exists(scp_path):
+            scp_df = pd.read_csv(scp_path, index_col=0)
+            scp_df = scp_df[scp_df.diagnostic == 1]
+            diagnostic_classes = sorted(scp_df["diagnostic_class"].unique().tolist())
+            self.class_to_idx = {cls: idx for idx, cls in enumerate(diagnostic_classes)}
+            self.idx_to_class = {idx: cls for cls, idx in self.class_to_idx.items()}
+            self.num_classes = len(diagnostic_classes)
+            print(f"Found {self.num_classes} diagnostic classes: {diagnostic_classes}")
+        else:
+            print("Warning: scp_statements.csv not found. Class conditioning disabled.")
+            self.num_classes = 1
+
         df = pd.read_csv(csv_path)
+        # Parse scp_codes if available
+        if "scp_codes" in df.columns:
+            df["scp_codes"] = df["scp_codes"].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+        
         target_folds = self._resolve_folds(split, folds)
         if target_folds is not None:
             df = df[df["strat_fold"].isin(target_folds)]
 
         if df.empty:
             raise RuntimeError("No records selected for the given split/folds.")
+        
+        self.df = df
 
         cache_dir = cache_dir or os.path.join(self.data_dir, "cache")
         os.makedirs(cache_dir, exist_ok=True)
@@ -105,15 +137,23 @@ class PTBXLWaveformDataset(Dataset):
         if os.path.exists(self.cache_path):
             payload = torch.load(self.cache_path, map_location="cpu")
             self.segments = [seg.clone() for seg in payload["segments"]]
+            if "labels" in payload:
+                labels_tensor = payload["labels"]
+                self.labels = labels_tensor.tolist() if isinstance(labels_tensor, torch.Tensor) else payload["labels"]
+            else:
+                # Fallback: create dummy labels if cache doesn't have them
+                self.labels = [0] * len(self.segments)
             return
 
         self.segments: List[torch.Tensor] = []
+        self.labels: List[int] = []
         self._build_dataset(df)
         if not self.segments:
             raise RuntimeError("Failed to collect any PTB-XL segments.")
 
         stacked = torch.stack(self.segments)
-        torch.save({"segments": stacked}, self.cache_path)
+        labels_tensor = torch.tensor(self.labels, dtype=torch.long)
+        torch.save({"segments": stacked, "labels": labels_tensor}, self.cache_path)
 
     def _maybe_download(self) -> None:
         """Downloads PTB-XL via wfdb if files are missing."""
@@ -163,14 +203,44 @@ class PTBXLWaveformDataset(Dataset):
             indices.append(upper_names.index(lead))
         return signal[:, indices].T
 
+    def _extract_class_label(self, row: pd.Series) -> int:
+        """Extract diagnostic class label from row. Returns 0 if no class found."""
+        if self.class_to_idx is None or "scp_codes" not in row:
+            return 0
+        
+        scp_codes = row.get("scp_codes", {})
+        if not isinstance(scp_codes, dict):
+            return 0
+        
+        # Find first diagnostic class in scp_codes
+        scp_path = os.path.join(self.data_dir, "scp_statements.csv")
+        if os.path.exists(scp_path):
+            scp_df = pd.read_csv(scp_path, index_col=0)
+            scp_df = scp_df[scp_df.diagnostic == 1]
+            for code in scp_codes.keys():
+                if code in scp_df.index:
+                    diag_class = scp_df.loc[code].diagnostic_class
+                    if diag_class in self.class_to_idx:
+                        return self.class_to_idx[diag_class]
+        return 0
+
     def _build_dataset(self, df: pd.DataFrame) -> None:
-        for _, row in df.iterrows():
+        iterator = tqdm(
+            df.iterrows(),
+            total=len(df),
+            desc="Building PTB-XL cache",
+            disable=len(df) == 0,
+        )
+        for _, row in iterator:
             record_path = self._resolve_record_path(row)
             try:
                 signal, fields = wfdb.rdsamp(record_path)
             except Exception as exc:
                 print(f"Skipping {record_path}: {exc}")
                 continue
+
+            # Extract class label for this record
+            class_label = self._extract_class_label(row)
 
             leads = self._select_leads(signal, fields["sig_name"], self.leads)
             length = leads.shape[1]
@@ -182,21 +252,28 @@ class PTBXLWaveformDataset(Dataset):
                     start = self.rng.integers(0, max(1, length - self.window_size + 1))
                     crop = leads[:, start : start + self.window_size]
                     tensor = torch.from_numpy(crop).float()
+                    tensor = _mean_center_signal(tensor)
                     if self.normalize:
                         tensor = _normalize_signal(tensor)
                     self.segments.append(tensor)
+                    self.labels.append(class_label)
                 continue
 
             tensor = torch.from_numpy(leads[:, : self.window_size]).float()
+            tensor = _mean_center_signal(tensor)
             if self.normalize:
                 tensor = _normalize_signal(tensor)
             self.segments.append(tensor)
+            self.labels.append(class_label)
 
     def __len__(self) -> int:
         return len(self.segments)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        # Output shape: (C, window_size)
-        return self.segments[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        # Output: (signal, class_label)
+        # signal shape: (C, window_size)
+        signal = self.segments[idx]
+        label = self.labels[idx] if idx < len(self.labels) else 0
+        return signal, label
 
 

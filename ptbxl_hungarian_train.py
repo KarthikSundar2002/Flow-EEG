@@ -13,7 +13,7 @@ try:
 except ImportError:  # pragma: no cover
     wandb = None
 
-from model import UNet1D
+from dit_model import ECG_DiT_1D
 from ptbxl_dataset import PTBXLWaveformDataset
 
 
@@ -41,6 +41,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-run-id", type=str, default=None)
     parser.add_argument("--disable-wandb", action="store_true")
     parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--dit-hidden", type=int, default=256, help="DiT hidden size")
+    parser.add_argument("--dit-depth", type=int, default=6, help="DiT depth (number of blocks)")
+    parser.add_argument("--dit-heads", type=int, default=8, help="DiT attention heads")
+    parser.add_argument("--dit-patch-size", type=int, default=16, help="DiT patch size")
     return parser.parse_args()
 
 
@@ -125,7 +129,18 @@ def train(args: argparse.Namespace) -> None:
         drop_last=True,
     )
 
-    model = UNet1D(in_channels=1, dim=64).to(device)
+    # Get number of classes from dataset
+    num_classes = dataset.num_classes if hasattr(dataset, 'num_classes') else 1
+    print(f"Using {num_classes} classes for conditioning")
+
+    model = ECG_DiT_1D(
+        input_size=args.window_size,
+        patch_size=args.dit_patch_size,
+        hidden_size=args.dit_hidden,
+        depth=args.dit_depth,
+        num_heads=args.dit_heads,
+        num_classes=num_classes,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     cfm = TargetConditionalFlowMatcher(sigma=0.0)
 
@@ -154,6 +169,11 @@ def train(args: argparse.Namespace) -> None:
                 "window_size": args.window_size,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
+                "dit_hidden": args.dit_hidden,
+                "dit_depth": args.dit_depth,
+                "dit_heads": args.dit_heads,
+                "dit_patch_size": args.dit_patch_size,
+                "num_classes": num_classes,
             },
         )
         wandb.watch(model, log="all")
@@ -163,7 +183,19 @@ def train(args: argparse.Namespace) -> None:
         epoch_loss = 0.0
         progress = tqdm(dataloader, desc=f"PTB-XL Hungarian Epoch {epoch+1}/{args.epochs}")
 
-        for data_batch in progress:
+        for batch_data in progress:
+            # Handle tuple (signal, label) or just signal
+            if isinstance(batch_data, tuple):
+                data_batch, y_batch = batch_data
+                y = y_batch.to(device, non_blocking=True)
+            else:
+                data_batch = batch_data
+                y = torch.zeros(data_batch.shape[0], dtype=torch.long).to(device)
+            
+            # Ensure data is (B, 1, window) - take first channel if multi-channel
+            if data_batch.dim() == 3 and data_batch.shape[1] > 1:
+                data_batch = data_batch[:, 0:1, :]  # Take first channel
+            
             data_cpu = data_batch.cpu()
             noise_cpu = torch.randn_like(data_cpu)
             matched_noise, matched_data = hungarian_align(noise_cpu, data_cpu)
@@ -171,7 +203,7 @@ def train(args: argparse.Namespace) -> None:
             x0 = matched_noise.to(device, non_blocking=True)
             x1 = matched_data.to(device, non_blocking=True)
             t, xt, ut = cfm.sample_location_and_conditional_flow(x0, x1)
-            vt = model(xt, t)
+            vt = model(xt, t, y)
             loss = torch.mean((vt - ut) ** 2)
 
             optimizer.zero_grad()

@@ -12,7 +12,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     wandb = None
 
-from model import UNet1D
+from dit_model import ECG_DiT_1D
 from ptbxl_dataset import PTBXLWaveformDataset
 
 
@@ -21,23 +21,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=str, required=True, help="Path to the extracted PTB-XL folder.")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test", "all"])
     parser.add_argument("--folds", type=str, default=None, help="Comma-separated list of folds overriding --split.")
-    parser.add_argument("--sampling-rate", type=int, default=500, choices=[100, 500])
+    parser.add_argument("--sampling-rate", type=int, default=100, choices=[100, 500])
     parser.add_argument("--lead", type=str, default="II", help="Lead to train on (e.g., II, V2).")
     parser.add_argument("--window-size", type=int, default=1024)
     parser.add_argument("--samples-per-record", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--epochs", type=int, default=100000)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--checkpoint", type=str, default="checkpoints/ptbxl/latest.pt")
     parser.add_argument("--resume", action="store_true", help="Resume from --checkpoint if it exists.")
     parser.add_argument("--cache-dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--wandb-project", type=str, default="ptbxl-flow")
+    parser.add_argument("--wandb-project", type=str, default="flow-Arythmiz")
     parser.add_argument("--wandb-run-id", type=str, default=None)
     parser.add_argument("--disable-wandb", action="store_true")
-    parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument("--dit-hidden", type=int, default=512, help="DiT hidden size")
+    parser.add_argument("--dit-depth", type=int, default=8, help="DiT depth (number of blocks)")
+    parser.add_argument("--dit-heads", type=int, default=8, help="DiT attention heads")
+    parser.add_argument("--dit-patch-size", type=int, default=16, help="DiT patch size")
     return parser.parse_args()
 
 
@@ -103,9 +107,22 @@ def train(args: argparse.Namespace) -> None:
         drop_last=True,
     )
 
-    model = UNet1D(in_channels=1, dim=64).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    cfm = TargetConditionalFlowMatcher(sigma=0.0)
+    # Get number of classes from dataset
+    num_classes = dataset.num_classes if hasattr(dataset, 'num_classes') else 1
+    print(f"Using {num_classes} classes for conditioning")
+
+    model = ECG_DiT_1D(
+        input_size=args.window_size,
+        patch_size=args.dit_patch_size,
+        hidden_size=args.dit_hidden,
+        depth=args.dit_depth,
+        num_heads=args.dit_heads,
+        num_classes=num_classes,
+    ).to(device)
+    model = torch.compile(model)
+   
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3400)
 
     start_epoch = 0
     global_step = 0
@@ -132,32 +149,63 @@ def train(args: argparse.Namespace) -> None:
                 "window_size": args.window_size,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
+                "dit_hidden": args.dit_hidden,
+                "dit_depth": args.dit_depth,
+                "dit_heads": args.dit_heads,
+                "dit_patch_size": args.dit_patch_size,
+                "num_classes": num_classes,
             },
         )
         wandb.watch(model, log="all")
 
     model.train()
+    cfm = TargetConditionalFlowMatcher(sigma=0.05)
     for epoch in range(start_epoch, args.epochs):
         epoch_loss = 0.0
         progress = tqdm(dataloader, desc=f"PTB-XL Epoch {epoch+1}/{args.epochs}")
 
-        for batch in progress:
-            # (B, 1, window)
-            x1 = batch.to(device)
+        for batch_data in progress:
+            # Handle tuple/list (signal, label) or just signal
+            if isinstance(batch_data, (tuple, list)):
+                if len(batch_data) >= 2:
+                    x1, y = batch_data[:2]
+                else:
+                    x1 = batch_data[0]
+                    y = torch.zeros(x1.shape[0], dtype=torch.long)
+            else:
+                x1 = batch_data
+                y = torch.zeros(x1.shape[0], dtype=torch.long)
+
+            x1 = x1.to(device)
+            y = y.to(device, dtype=torch.long)
+            
+            # Ensure x1 is (B, 1, window) - take first channel if multi-channel
+            if x1.dim() == 3 and x1.shape[1] > 1:
+                x1 = x1[:, 0:1, :]  # Take first channel
+            
             x0 = torch.randn_like(x1)
             t, xt, ut = cfm.sample_location_and_conditional_flow(x0, x1)
-            vt = model(xt, t)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                vt = model(xt, t, y)
+            ut = ut.to(torch.bfloat16)
             loss = torch.mean((vt - ut) ** 2)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
+            scheduler.step(loss)
+            current_lr = optimizer.param_groups[0].get("lr", args.lr)
             epoch_loss += loss.item()
             global_step += 1
             progress.set_postfix({"loss": loss.item()})
             if use_wandb:
-                wandb.log({"train/loss": loss.item()}, step=global_step)
+                wandb.log(
+                    {
+                        "train/loss": loss.item(),
+                        "train/lr": current_lr,
+                    },
+                    step=global_step,
+                )
 
         avg_loss = epoch_loss / len(dataloader)
         print(f"Epoch {epoch+1} average loss: {avg_loss:.6f}")

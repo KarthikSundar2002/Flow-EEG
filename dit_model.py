@@ -1,6 +1,34 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
+
+
+class FlashSelfAttention(nn.Module):
+    """
+    Multi-head self-attention implemented with scaled_dot_product_attention,
+    enabling FlashAttention kernels when available (PyTorch 2+ with CUDA).
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int):
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, n, c = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.view(b, n, 3, self.num_heads, self.head_dim).unbind(dim=2)
+        q = q.transpose(1, 2)  # (B, heads, N, head_dim)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        attn_out = F.scaled_dot_product_attention(q, k, v)  # FlashAttention when backend supports it
+        attn_out = attn_out.transpose(1, 2).contiguous().view(b, n, c)
+        return self.proj(attn_out)
 
 class TimestepEmbedder(nn.Module):
     """
@@ -45,7 +73,7 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = nn.MultiheadAttention(hidden_size, num_heads=num_heads, batch_first=True)
+        self.attn = FlashSelfAttention(hidden_size, num_heads=num_heads)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -72,7 +100,7 @@ class DiTBlock(nn.Module):
         x_norm1 = self.norm1(x)
         # Modulate
         x_norm1 = x_norm1 * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        attn_out, _ = self.attn(x_norm1, x_norm1, x_norm1)
+        attn_out = self.attn(x_norm1)
         x = x + gate_msa.unsqueeze(1) * attn_out
         
         # 2. MLP Block with AdaLN
