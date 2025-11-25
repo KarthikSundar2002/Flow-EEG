@@ -54,10 +54,10 @@ def parse_fold_override(folds: Optional[str]) -> Optional[List[int]]:
 def load_checkpoint(path: str, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: torch.device):
     checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    epoch = checkpoint.get("epoch", 0) + 1
-    global_step = checkpoint.get("global_step", 0)
-    wandb_id = checkpoint.get("wandb_run_id")
+    #optimizer.load_state_dict(checkpoint["optimizer"])
+    epoch = 1
+    global_step = 0
+    wandb_id = None
     print(f"Resumed from {path} at epoch {epoch}")
     return epoch, global_step, wandb_id
 
@@ -122,7 +122,9 @@ def train(args: argparse.Namespace) -> None:
     model = torch.compile(model)
    
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3400)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6
+    )
 
     start_epoch = 0
     global_step = 0
